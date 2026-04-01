@@ -1,0 +1,17 @@
+[project]
+name = "pdm-augmentation"
+version = "0.1.0"
+description = "TimeGAN-based synthetic data augmentation for Azure PdM dataset"
+requires-python = ">=3.10"
+dependencies = [
+    "pandas",
+    "numpy",
+    "scikit-learn",
+    "torch",
+    "tqdm",
+    "joblib",
+    "pyarrow",
+]
+
+[tool.uv]
+package = false
