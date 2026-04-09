@@ -28,25 +28,50 @@ They combine **wide aggregations**, **window functions**, **CTEs**, and **multi-
 
 **Complexity:** 🟡 Heavy
 
+#### DuckDB
+
 ```sql
+.mode table
+.maxrows 1000000
+.maxwidth 0
+
 SELECT
   DATE(datetime) AS day,
   machineID,
-
   AVG(volt)         AS avg_volt,
   AVG(rotate)       AS avg_rotate,
   AVG(pressure)     AS avg_pressure,
   AVG(vibration)    AS avg_vibration,
-
   STDDEV(volt)      AS std_volt,
   STDDEV(rotate)    AS std_rotate,
   STDDEV(vibration) AS std_vibration,
-
   MAX(vibration)    AS max_vibration
 FROM read_parquet(
   'abfss://<container>@<account>.dfs.core.windows.net/pdm/PdM_telemetry.parquet'
 )
-GROUP BY day, machineID;
+GROUP BY day, machineID
+ORDER BY machineID, day;
+```
+If the result is still too large for the terminal to be practical, export it instead:
+```sql
+COPY (
+  SELECT
+    DATE(datetime) AS day,
+    machineID,
+    AVG(volt)         AS avg_volt,
+    AVG(rotate)       AS avg_rotate,
+    AVG(pressure)     AS avg_pressure,
+    AVG(vibration)    AS avg_vibration,
+    STDDEV(volt)      AS std_volt,
+    STDDEV(rotate)    AS std_rotate,
+    STDDEV(vibration) AS std_vibration,
+    MAX(vibration)    AS max_vibration
+  FROM read_parquet(
+    'abfss://<container>@<account>.dfs.core.windows.net/pdm/PdM_telemetry.parquet'
+  )
+  GROUP BY day, machineID
+  ORDER BY machineID, day
+) TO 'output.csv' (HEADER, DELIMITER ',');
 ```
 
 **What this tests**
@@ -228,6 +253,292 @@ GROUP BY day, t.machineID;
 * Wide aggregation outputs
 * Join correctness under duplication risk
 * End-to-end ML training dataset preparation
+
+
+### 12. Monthly fleet risk summary (multi-stage aggregation + joins + windowing)
+
+**Complexity:** 🔴 Super-Heavy
+
+```sql
+WITH telemetry_daily AS (
+  SELECT
+    DATE(datetime) AS day,
+    machineID,
+    AVG(volt)         AS avg_volt,
+    AVG(rotate)       AS avg_rotate,
+    AVG(pressure)     AS avg_pressure,
+    AVG(vibration)    AS avg_vibration,
+    STDDEV(vibration) AS std_vibration,
+    MAX(vibration)    AS max_vibration,
+    COUNT(*)          AS telemetry_rows
+  FROM "iot-587_mil_rows-parquet".main.pdm_telemetry
+  WHERE datetime >= TIMESTAMP '2016-01-01 00:00:00'
+    AND datetime <  TIMESTAMP '2017-01-01 00:00:00'
+  GROUP BY DATE(datetime), machineID
+),
+
+errors_daily AS (
+  SELECT
+    DATE(datetime) AS day,
+    machineID,
+    COUNT(*) AS error_count
+  FROM "iot-587_mil_rows-parquet".main.pdm_errors
+  WHERE datetime >= TIMESTAMP '2016-01-01 00:00:00'
+    AND datetime <  TIMESTAMP '2017-01-01 00:00:00'
+  GROUP BY DATE(datetime), machineID
+),
+
+maint_daily AS (
+  SELECT
+    DATE(datetime) AS day,
+    machineID,
+    COUNT(*) AS maint_count
+  FROM "iot-587_mil_rows-parquet".main.pdm_maint
+  WHERE datetime >= TIMESTAMP '2016-01-01 00:00:00'
+    AND datetime <  TIMESTAMP '2017-01-01 00:00:00'
+  GROUP BY DATE(datetime), machineID
+),
+
+failures_daily AS (
+  SELECT
+    DATE(datetime) AS day,
+    machineID,
+    COUNT(*) AS failure_count
+  FROM "iot-587_mil_rows-parquet".main.pdm_failures
+  WHERE datetime >= TIMESTAMP '2016-01-01 00:00:00'
+    AND datetime <  TIMESTAMP '2017-01-01 00:00:00'
+  GROUP BY DATE(datetime), machineID
+),
+
+machine_month AS (
+  SELECT
+    DATE_TRUNC('month', t.day) AS month,
+    t.machineID,
+    m.model,
+    m.age,
+
+    AVG(t.avg_volt)         AS avg_volt,
+    AVG(t.avg_rotate)       AS avg_rotate,
+    AVG(t.avg_pressure)     AS avg_pressure,
+    AVG(t.avg_vibration)    AS avg_vibration,
+    AVG(t.std_vibration)    AS avg_daily_std_vibration,
+    MAX(t.max_vibration)    AS month_max_vibration,
+    SUM(t.telemetry_rows)   AS telemetry_rows,
+
+    SUM(COALESCE(e.error_count, 0))   AS total_errors,
+    SUM(COALESCE(md.maint_count, 0))  AS total_maintenance,
+    SUM(COALESCE(f.failure_count, 0)) AS total_failures,
+
+    MAX(CASE WHEN COALESCE(f.failure_count, 0) > 0 THEN 1 ELSE 0 END) AS had_failure
+  FROM telemetry_daily t
+  LEFT JOIN errors_daily e
+    ON t.machineID = e.machineID
+   AND t.day = e.day
+  LEFT JOIN maint_daily md
+    ON t.machineID = md.machineID
+   AND t.day = md.day
+  LEFT JOIN failures_daily f
+    ON t.machineID = f.machineID
+   AND t.day = f.day
+  LEFT JOIN "iot-587_mil_rows-parquet".main.pdm_machines m
+    ON t.machineID = m.machineID
+  GROUP BY
+    DATE_TRUNC('month', t.day),
+    t.machineID,
+    m.model,
+    m.age
+),
+
+WITH telemetry_daily AS (
+  SELECT
+    DATE(datetime) AS day,
+    machineID,
+    AVG(volt)         AS avg_volt,
+    AVG(rotate)       AS avg_rotate,
+    AVG(pressure)     AS avg_pressure,
+    AVG(vibration)    AS avg_vibration,
+    STDDEV(vibration) AS std_vibration,
+    MAX(vibration)    AS max_vibration,
+    COUNT(*)          AS telemetry_rows
+  FROM "iot-587_mil_rows-parquet".main.pdm_telemetry
+  WHERE datetime >= TIMESTAMP '2016-01-01 00:00:00'
+    AND datetime <  TIMESTAMP '2017-01-01 00:00:00'
+  GROUP BY DATE(datetime), machineID
+),
+
+errors_daily AS (
+  SELECT
+    DATE(datetime) AS day,
+    machineID,
+    COUNT(*) AS error_count
+  FROM "iot-587_mil_rows-parquet".main.pdm_errors
+  WHERE datetime >= TIMESTAMP '2016-01-01 00:00:00'
+    AND datetime <  TIMESTAMP '2017-01-01 00:00:00'
+  GROUP BY DATE(datetime), machineID
+),
+
+maint_daily AS (
+  SELECT
+    DATE(datetime) AS day,
+    machineID,
+    COUNT(*) AS maint_count
+  FROM "iot-587_mil_rows-parquet".main.pdm_maint
+  WHERE datetime >= TIMESTAMP '2016-01-01 00:00:00'
+    AND datetime <  TIMESTAMP '2017-01-01 00:00:00'
+  GROUP BY DATE(datetime), machineID
+),
+
+failures_daily AS (
+  SELECT
+    DATE(datetime) AS day,
+    machineID,
+    COUNT(*) AS failure_count
+  FROM "iot-587_mil_rows-parquet".main.pdm_failures
+  WHERE datetime >= TIMESTAMP '2016-01-01 00:00:00'
+    AND datetime <  TIMESTAMP '2017-01-01 00:00:00'
+  GROUP BY DATE(datetime), machineID
+),
+
+machine_month AS (
+  SELECT
+    DATE_TRUNC('month', t.day) AS month,
+    t.machineID,
+    m.model,
+    m.age,
+
+    AVG(t.avg_volt)         AS avg_volt,
+    AVG(t.avg_rotate)       AS avg_rotate,
+    AVG(t.avg_pressure)     AS avg_pressure,
+    AVG(t.avg_vibration)    AS avg_vibration,
+    AVG(t.std_vibration)    AS avg_daily_std_vibration,
+    MAX(t.max_vibration)    AS month_max_vibration,
+    SUM(t.telemetry_rows)   AS telemetry_rows,
+
+    SUM(COALESCE(e.error_count, 0))   AS total_errors,
+    SUM(COALESCE(md.maint_count, 0))  AS total_maintenance,
+    SUM(COALESCE(f.failure_count, 0)) AS total_failures,
+
+    MAX(CASE WHEN COALESCE(f.failure_count, 0) > 0 THEN 1 ELSE 0 END) AS had_failure
+  FROM telemetry_daily t
+  LEFT JOIN errors_daily e
+    ON t.machineID = e.machineID
+   AND t.day = e.day
+  LEFT JOIN maint_daily md
+    ON t.machineID = md.machineID
+   AND t.day = md.day
+  LEFT JOIN failures_daily f
+    ON t.machineID = f.machineID
+   AND t.day = f.day
+  LEFT JOIN "iot-587_mil_rows-parquet".main.pdm_machines m
+    ON t.machineID = m.machineID
+  GROUP BY
+    DATE_TRUNC('month', t.day),
+    t.machineID,
+    m.model,
+    m.age
+),
+
+scored AS (
+  SELECT
+    *,
+    AVG(total_errors) OVER (
+      PARTITION BY machineID
+      ORDER BY month
+      ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+    ) AS rolling_3m_avg_errors,
+
+    AVG(total_failures) OVER (
+      PARTITION BY machineID
+      ORDER BY month
+      ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+    ) AS rolling_3m_avg_failures,
+
+    RANK() OVER (
+      PARTITION BY month
+      ORDER BY total_failures DESC, total_errors DESC, month_max_vibration DESC
+    ) AS monthly_risk_rank
+  FROM machine_month
+)
+
+SELECT
+  month,
+  COUNT(*) AS machines_in_month,
+  SUM(telemetry_rows) AS telemetry_rows,
+  SUM(total_errors) AS total_errors,
+  SUM(total_maintenance) AS total_maintenance,
+  SUM(total_failures) AS total_failures,
+  AVG(avg_volt) AS fleet_avg_volt,
+  AVG(avg_rotate) AS fleet_avg_rotate,
+  AVG(avg_pressure) AS fleet_avg_pressure,
+  AVG(avg_vibration) AS fleet_avg_vibration,
+  MAX(month_max_vibration) AS fleet_max_vibration,
+  AVG(age) AS avg_machine_age,
+  SUM(CASE WHEN monthly_risk_rank <= 10 THEN 1 ELSE 0 END) AS top_10_risky_machines,
+  AVG(rolling_3m_avg_errors) AS fleet_rolling_3m_avg_errors,
+  AVG(rolling_3m_avg_failures) AS fleet_rolling_3m_avg_failures
+FROM scored
+GROUP BY month
+ORDER BY month;
+scored AS (
+  SELECT
+    *,
+    AVG(total_errors) OVER (
+      PARTITION BY machineID
+      ORDER BY month
+      ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+    ) AS rolling_3m_avg_errors,
+
+    AVG(total_failures) OVER (
+      PARTITION BY machineID
+      ORDER BY month
+      ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+    ) AS rolling_3m_avg_failures,
+
+    RANK() OVER (
+      PARTITION BY month
+      ORDER BY total_failures DESC, total_errors DESC, month_max_vibration DESC
+    ) AS monthly_risk_rank
+  FROM machine_month
+)
+
+SELECT
+  month,
+  COUNT(*) AS machines_in_month,
+  SUM(telemetry_rows) AS telemetry_rows,
+  SUM(total_errors) AS total_errors,
+  SUM(total_maintenance) AS total_maintenance,
+  SUM(total_failures) AS total_failures,
+  AVG(avg_volt) AS fleet_avg_volt,
+  AVG(avg_rotate) AS fleet_avg_rotate,
+  AVG(avg_pressure) AS fleet_avg_pressure,
+  AVG(avg_vibration) AS fleet_avg_vibration,
+  MAX(month_max_vibration) AS fleet_max_vibration,
+  AVG(age) AS avg_machine_age,
+  SUM(CASE WHEN monthly_risk_rank <= 10 THEN 1 ELSE 0 END) AS top_10_risky_machines,
+  AVG(rolling_3m_avg_errors) AS fleet_rolling_3m_avg_errors,
+  AVG(rolling_3m_avg_failures) AS fleet_rolling_3m_avg_failures
+FROM scored
+GROUP BY month
+ORDER BY month;
+```
+
+**What this tests**
+
+* Multi-stage aggregation over large telemetry volumes
+* Multi-way joins with operational event tables and machine metadata
+* Rolling-window analytics and per-month risk ranking
+* Heavy intermediate computation with minimal final UI output
+
+
+**Why it qualifies as super-heavy**
+
+* it scans the large pdm_telemetry table
+* it aggregates at daily machine level first
+* it joins 4 other datasets
+* it aggregates again at monthly machine level
+* it applies window functions
+* it applies ranking
+* only then does it collapse to a tiny monthly summary
 
 ---
 
