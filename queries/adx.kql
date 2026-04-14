@@ -1,0 +1,94 @@
+let start = datetime(2015-01-01);
+let end   = datetime(2017-01-01);
+// -------- Daily ----------
+let telemetry_daily =
+    pdm_telemetry
+    | where date_time >= start and date_time < end
+    | extend day = startofday(date_time)
+    | summarize
+        avg_volt       = avg(volt),
+        avg_rotate     = avg(rotate),
+        avg_pressure   = avg(pressure),
+        avg_vibration  = avg(vibration),
+        std_vibration  = stdev(vibration),
+        max_vibration  = max(vibration),
+        telemetry_rows = count()
+      by day, machineID;
+let errors_daily =
+    pdm_errors
+    | where date_time >= start and date_time < end
+    | extend day = startofday(date_time)
+    | summarize error_count = count()
+      by day, machineID;
+let maint_daily =
+    pdm_maint
+    | where date_time >= start and date_time < end
+    | extend day = startofday(date_time)
+    | summarize maint_count = count()
+      by day, machineID;
+let failures_daily =
+    pdm_failures
+    | where date_time >= start and date_time < end
+    | extend day = startofday(date_time)
+    | summarize failure_count = count()
+      by day, machineID;
+// -------- Monthly (FACTS ONLY) ----------
+let machine_month =
+    telemetry_daily
+    | join kind=leftouter errors_daily   on machineID, day
+    | join kind=leftouter maint_daily    on machineID, day
+    | join kind=leftouter failures_daily on machineID, day
+    | extend
+        month = startofmonth(day),
+        error_count   = coalesce(error_count, 0),
+        maint_count   = coalesce(maint_count, 0),
+        failure_count = coalesce(failure_count, 0)
+    | summarize
+        avg_volt                = avg(avg_volt),
+        avg_rotate              = avg(avg_rotate),
+        avg_pressure            = avg(avg_pressure),
+        avg_vibration           = avg(avg_vibration),
+        avg_daily_std_vibration = avg(std_vibration),
+        month_max_vibration     = max(max_vibration),
+        telemetry_rows          = sum(telemetry_rows),
+        total_errors            = sum(error_count),
+        total_maintenance       = sum(maint_count),
+        total_failures          = sum(failure_count),
+        had_failure             = max(iff(failure_count > 0, 1, 0))
+      by month, machineID;
+// -------- Join DIMENSIONS AFTER aggregation ----------
+let scored =
+    machine_month
+    | join kind=leftouter pdm_machines on machineID
+    | sort by machineID, month
+    | serialize
+    | extend
+        e1 = iff(machineID == prev(machineID), todouble(prev(total_errors)),   0.0),
+        e2 = iff(machineID == prev(machineID,2),todouble(prev(total_errors,2)),0.0),
+        f1 = iff(machineID == prev(machineID), todouble(prev(total_failures)), 0.0),
+        f2 = iff(machineID == prev(machineID,2),todouble(prev(total_failures,2)),0.0)
+    | extend
+        rolling_3m_avg_errors   = (total_errors   + e1 + e2) / 3.0,
+        rolling_3m_avg_failures = (total_failures + f1 + f2) / 3.0
+    | sort by month asc, total_failures desc, total_errors desc, month_max_vibration desc
+    | serialize
+    | extend monthly_risk_rank = row_number(1, month != prev(month));
+// -------- Fleet monthly --------
+scored
+| summarize
+    machines_in_month             = count(),
+    telemetry_rows                = sum(telemetry_rows),
+    total_errors                  = sum(total_errors),
+    total_maintenance             = sum(total_maintenance),
+    total_failures                = sum(total_failures),
+    fleet_avg_volt                = avg(avg_volt),
+    fleet_avg_rotate              = avg(avg_rotate),
+    fleet_avg_pressure            = avg(avg_pressure),
+    fleet_avg_vibration           = avg(avg_vibration),
+    fleet_max_vibration           = max(month_max_vibration),
+    avg_machine_age               = avg(todouble(age)),
+    top_10_risky_machines         = countif(monthly_risk_rank <= 10),
+    fleet_rolling_3m_avg_errors   = avg(rolling_3m_avg_errors),
+    fleet_rolling_3m_avg_failures = avg(rolling_3m_avg_failures)
+  by month
+| order by month
